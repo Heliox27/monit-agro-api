@@ -49,6 +49,7 @@ model Task {
 model Device {
   id        String  @id @default(cuid())
   name      String          // “Farm A Sensor”
+  mdnsName  String   @unique 
   mdnsName  String?         // "farma" (para http://farma.local)
   lastIp    String?         // última IP vista
   lastSeen  DateTime?       // último ping/lectura
