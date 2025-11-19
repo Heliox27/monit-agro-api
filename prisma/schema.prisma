@@ -8,18 +8,19 @@ datasource db {
 }
 
 model Farm {
-  id      String   @id @default(cuid())
-  name    String
-  slug    String   @unique
-  reports Report[]
-  tasks   Task[]
-  devices Device[]
+  id       String    @id @default(cuid())
+  name     String
+  slug     String    @unique
+  reports  Report[]
+  tasks    Task[]
+  devices  Device[]
+  readings Reading[]
 }
 
 model Report {
-  id         String   @id @default(cuid())
-  farmId     String
-  farm       Farm     @relation(fields: [farmId], references: [id])
+  id     String @id @default(cuid())
+  farmId String
+  farm   Farm   @relation(fields: [farmId], references: [id])
 
   ts         DateTime @default(now())
   temp       Float?
@@ -47,15 +48,32 @@ model Task {
 }
 
 model Device {
-  id        String   @id @default(cuid())
-  name      String
-  mdnsName  String   @unique   // ← única definición
-  lastIp    String?
-  lastSeen  DateTime?
-  farmId    String
-  farm      Farm     @relation(fields: [farmId], references: [id])
-  active    Boolean  @default(true)
-  readings  Reading[]
+  id       String    @id @default(cuid())
+  name     String
+  mdnsName String    @unique
+  lastIp   String?
+  lastSeen DateTime?
+  farmId   String
+  farm     Farm      @relation(fields: [farmId], references: [id])
+  active   Boolean   @default(true)
+
+  readings Reading[] // ← ya existía
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model Reading {
+  id       String   @id @default(cuid())
+  farmId   String
+  deviceId String?
+  payload  Json // aquí guardamos el JSON que emite el Arduino
+  ts       DateTime @default(now())
+
+  // Relaciones
+  farm   Farm    @relation(fields: [farmId], references: [id])
+  device Device? @relation(fields: [deviceId], references: [id])
+
+  @@index([farmId, ts])
+  @@index([deviceId, ts])
 }
