@@ -8,32 +8,14 @@ datasource db {
 }
 
 model Farm {
-  id       String    @id @default(cuid())
-  name     String
-  slug     String    @unique
-  reports  Report[]
-  tasks    Task[]
-  devices  Device[]
-  readings Reading[]
-}
-
-model Report {
-  id     String @id @default(cuid())
-  farmId String
-  farm   Farm   @relation(fields: [farmId], references: [id])
-
-  ts         DateTime @default(now())
-  temp       Float?
-  humAir     Float?
-  humSuelo   Int?
-  bomba      Boolean?
-  auto       Boolean?
-  potencia   Int?
-  min        Int?
-  max        Int?
-  analisisIA String?
-  // Podrías guardar el historial crudo en JSON si quieres:
-  // rawHist    Json?
+  id        String    @id @default(cuid())
+  name      String
+  location  String?
+  devices   Device[]
+  readings  Reading[] // si quieres vincular lecturas directas a la finca
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  tasks     Task[]
 }
 
 model Task {
