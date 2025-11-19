@@ -13,6 +13,7 @@ model Farm {
   slug    String   @unique
   reports Report[]
   tasks   Task[]
+  devices Device[]
 }
 
 model Report {
