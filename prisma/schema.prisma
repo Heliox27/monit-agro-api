@@ -1,0 +1,43 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite" // local rápido; luego pasamos a Postgres
+  url      = env("DATABASE_URL")
+}
+
+model Farm {
+  id      String   @id @default(cuid())
+  name    String
+  slug    String   @unique
+  reports Report[]
+  tasks   Task[]
+}
+
+model Report {
+  id               String   @id @default(cuid())
+  ts               DateTime @default(now())
+  farmId           String
+  soil_moisture    Float?
+  soil_temp        Float?
+  soil_ph          Float?
+  light            Float?
+  air_humidity     Float?
+  air_temp         Float?
+  pump_status      Boolean? @default(false)
+  sprinkler_status Boolean? @default(false)
+
+  farm Farm @relation(fields: [farmId], references: [id])
+}
+
+model Task {
+  id     String   @id @default(cuid())
+  ts     DateTime @default(now())
+  farmId String
+  type   String
+  cost   Float    @default(0)
+  notes  String?
+
+  farm Farm @relation(fields: [farmId], references: [id])
+}
