@@ -47,12 +47,15 @@ model Task {
 }
 
 model Device {
-  id        String  @id @default(cuid())
-  name      String          // “Farm A Sensor”
-  mdnsName  String?         // "farma" (para http://farma.local)
-  lastIp    String?         // última IP vista
-  lastSeen  DateTime?       // último ping/lectura
+  id        String   @id @default(cuid())
+  name      String
+  mdnsName  String   @unique   // ← única definición
+  lastIp    String?
+  lastSeen  DateTime?
   farmId    String
-  farm      Farm    @relation(fields: [farmId], references: [id])
-  active    Boolean @default(true)
+  farm      Farm     @relation(fields: [farmId], references: [id])
+  active    Boolean  @default(true)
+  readings  Reading[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
