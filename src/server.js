@@ -1,193 +1,205 @@
-// src/server.js
+// server.js — CommonJS, listo para Node 18+ (fetch nativo)
+require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 
 const app = express();
 const prisma = new PrismaClient();
 
-app.use(express.json());
+// ---------- Middlewares ----------
+const allowed = process.env.CORS_ORIGIN?.split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({ origin: allowed?.length ? allowed : '*' }));
+app.use(express.json({ limit: '1mb' }));
 
-// Ping
-app.get('/health', (_req, res) => res.json({ ok: true }));
+// ---------- Healthcheck ----------
+app.get('/healthz', (_, res) => res.send('ok'));
 
-// Lista de fincas
+// =============== API PARA LA APP ===============
+
+// FARMS
 app.get('/farms', async (_req, res) => {
-  try {
-    const farms = await prisma.farm.findMany({
-      select: { id: true, name: true, slug: true },
-      orderBy: { name: 'asc' },
-    });
-    res.json(farms);
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
+  const rows = await prisma.farm.findMany({
+    select: { id: true, name: true, location: true },
+    orderBy: { name: 'asc' },
+  });
+  res.json(rows);
 });
 
-// Históricos (opcionalmente filtra por ?farmId=...)
+// REPORTS (lecturas históricas)
 app.get('/reports', async (req, res) => {
-  try {
-    const { farmId } = req.query;
-    const where = farmId ? { farmId: String(farmId) } : {};
-    const reports = await prisma.report.findMany({
-      where,
-      orderBy: { ts: 'desc' },
-      take: 200,
-    });
-    res.json(reports);
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
+  const { farmId, limit = '200', order = 'asc' } = req.query;
+  const where = farmId ? { farmId: String(farmId) } : {};
+  const rows = await prisma.reading.findMany({
+    where,
+    orderBy: { ts: order === 'desc' ? 'desc' : 'asc' },
+    take: Number(limit) || undefined,
+  });
+  res.json(rows);
 });
 
-// Crear labor (por si ya lo usas desde la app)
+// TASKS (labores) CRUD
+app.get('/tasks', async (req, res) => {
+  const { farmId } = req.query;
+  const where = farmId ? { farmId: String(farmId) } : {};
+  const rows = await prisma.task.findMany({ where, orderBy: { ts: 'desc' } });
+  res.json(rows);
+});
+
 app.post('/tasks', async (req, res) => {
-  try {
-    const data = req.body || {};
-    const created = await prisma.task.create({ data });
-    res.status(201).json(created);
-  } catch (err) {
-    res.status(400).json({ error: String(err.message || err) });
-  }
+  const data = req.body || {};
+  data.farmId = String(data.farmId || 'farm-a');
+  data.type   = String(data.type   || 'riego');
+  data.cost   = Number(data.cost   || 0);
+  data.notes  = data.notes ? String(data.notes) : null;
+  data.ts     = data.ts ? new Date(data.ts) : new Date();
+  const row = await prisma.task.create({ data });
+  res.status(201).json(row);
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`API ready on http://localhost:${PORT}`);
+app.put('/tasks/:id', async (req, res) => {
+  const row = await prisma.task.update({ where: { id: req.params.id }, data: req.body });
+  res.json(row);
 });
 
-// seguridad básica con token (opcional, pero útil)
-const INGEST_TOKEN = process.env.INGEST_TOKEN || 'demo-token';
+app.delete('/tasks/:id', async (req, res) => {
+  await prisma.task.delete({ where: { id: req.params.id } });
+  res.status(204).end();
+});
 
-// El ESP32 (o un bridge) podrá hacer POST /ingest
-// Body esperado: { farmSlug, temp, humAir, humSuelo, bomba, auto, potencia, min, max, analisisIA, historial: [ "...", ... ] }
-app.post('/ingest', async (req, res) => {
+// =============== INGESTA (Arduino / Simulador) ===============
+//
+// 1) POST /reports  -> acepta formato "Arduino" (plano) y "backend" (payload)
+//    Si defines INGEST_SHARED_TOKEN en .env, exige header x-shared-token con ese valor.
+//
+app.post('/reports', async (req, res) => {
   try {
-    if ((req.headers['x-api-key'] || '') !== INGEST_TOKEN) {
-      return res.status(401).json({ error: 'no-auth' });
+    console.log('[IN] POST /reports keys=', Object.keys(req.body || {}));
+
+    // Token compartido (opcional)
+    if (process.env.INGEST_SHARED_TOKEN) {
+      const tok = req.get('x-shared-token') || '';
+      if (tok !== process.env.INGEST_SHARED_TOKEN) {
+        return res.status(401).json({ error: 'bad token' });
+      }
     }
 
-    const {
-      farmSlug,
-      temp, humAir, humSuelo, bomba, auto, potencia, min, max, analisisIA,
-    } = req.body || {};
+    const body = req.body || {};
+    const isArduino =
+      ('finca' in body) ||
+      ('temperatura' in body) ||
+      ('humedad_aire' in body) ||
+      ('humedad_suelo' in body);
 
-    if (!farmSlug) return res.status(400).json({ error: 'farmSlug required' });
+    let farmId   = body.farmId   || process.env.FARM_ID_DEFAULT   || 'farm-a';
+    let deviceId = body.deviceId || process.env.DEVICE_ID_DEFAULT || 'esp32-a';
+    let ts       = body.ts || body.timestamp || new Date().toISOString();
+    let payload  = body.payload;
 
-    const farm = await prisma.farm.findUnique({ where: { slug: farmSlug } });
-    if (!farm) return res.status(404).json({ error: 'farm not found' });
+    if (isArduino) {
+      // Normaliza JSON "plano" de Arduino a payload
+      payload = {
+        temp:       body.temperatura,
+        humAir:     body.humedad_aire,
+        humSuelo:   body.humedad_suelo,
+        bomba:      body.bomba_activa,
+        auto:       body.modo_automatico,
+        potencia:   body.potencia_bomba,
+        min:        body.umbral_min,
+        max:        body.umbral_max,
+        analisisIA: body.analisis_ia,
+      };
+      // Deriva farmId por nombre de finca si viene
+      if (typeof body.finca === 'string') {
+        const name = body.finca.trim().toLowerCase();
+        farmId = name.includes('b') ? 'farm-b' : 'farm-a';
+      }
+    }
 
-    const created = await prisma.report.create({
-      data: { farmId: farm.id, temp, humAir, humSuelo, bomba, auto, potencia, min, max, analisisIA },
+    if (!payload || typeof payload !== 'object') {
+      return res.status(400).json({ error: 'payload missing/invalid' });
+    }
+
+    // Asegura device
+    const device = await prisma.device.upsert({
+      where: { mdnsName: deviceId },
+      update: { lastSeen: new Date() },
+      create: { mdnsName: deviceId, name: deviceId, farmId, lastSeen: new Date() },
     });
 
-    // marca actividad de algún device de esa finca (si quieres)
-    await prisma.device.updateMany({
-      where: { farmId: farm.id },
-      data: { lastSeen: new Date() },
+    // Guarda lectura
+    const row = await prisma.reading.create({
+      data: { farmId, deviceId: device.id, payload, ts: new Date(ts) },
     });
 
-    res.status(201).json(created);
+    res.status(201).json(row);
   } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
+    console.error('POST /reports error:', e);
+    res.status(500).json({ error: 'internal error' });
   }
 });
 
-// === PULLER: trae datos del ESP32 cada 6s y guarda ===
-const PULL_MS = 6000;
-
-// Node 18+ ya tiene fetch global
-async function pullOnceForDevice(device) {
-  if (!device.mdnsName) return;
-
-  // Intentos por mDNS y por última IP conocida
-  const candidates = [
-    `http://${device.mdnsName}.local/datos`,
-    device.lastIp ? `http://${device.lastIp}/datos` : null,
-  ].filter(Boolean);
-
-  for (const url of candidates) {
-    try {
-      const res = await fetch(url, { timeout: 3000 });
-      if (!res.ok) continue;
-      const d = await res.json();
-
-      // Guarda lectura
-      await prisma.report.create({
-        data: {
-          farmId: device.farmId,
-          temp: Number(d.temp),
-          humAir: Number(d.humAir),
-          humSuelo: Number(d.humSuelo),
-          bomba: !!d.bomba,
-          auto: !!d.auto,
-          potencia: Number(d.potencia) || null,
-          min: Number(d.min) || null,
-          max: Number(d.max) || null,
-          analisisIA: String(d.analisisIA || ''),
-        },
-      });
-
-      // Actualiza IP y lastSeen
-      const ip = (res.headers.get('x-forwarded-for') || '').split(',')[0]?.trim();
-      await prisma.device.update({
-        where: { id: device.id },
-        data: { lastSeen: new Date(), lastIp: ip || device.lastIp },
-      });
-
-      console.log(`Pull OK ${device.name} via ${url}`);
-      return;
-    } catch (e) {
-      // sigue con el siguiente candidate
-    }
-  }
-  // Si ninguno respondió, no pasa nada (simulador cubrirá si activas)
+//
+// 2) Modo PULL (opcional): backend jala desde /datos del ESP32 sin tocar el sketch
+//
+function parseMaybeJson(text) {
+  try { return JSON.parse(text); } catch {}
+  const m = text.match(/{[\s\S]*}/);
+  if (m) { try { return JSON.parse(m[0]); } catch {} }
+  return { raw: text };
 }
 
-// Loop principal del puller
-async function startPuller() {
-  const devices = await prisma.device.findMany({ where: { active: true } });
-  setInterval(async () => {
-    for (const dev of devices) {
-      pullOnceForDevice(dev).catch(() => {});
-    }
-  }, PULL_MS);
-}
+const sensors = (process.env.SENSORS || '')
+  .split(',').map(s => s.trim()).filter(Boolean)
+  .map(s => {
+    // formato: farma@http://192.168.0.9/datos
+    const [key, url] = s.split('@');
+    return {
+      key,
+      url,
+      farmId: process.env[`SENSOR_FARM_${key}`] || 'farm-a',
+      host: (() => { try { return new URL(url).hostname; } catch { return null; } })()
+    };
+  });
 
-startPuller().catch(console.error);
+async function pollOnce(sensor) {
+  try {
+    const r = await fetch(sensor.url, { cache: 'no-store' });
+    const txt = await r.text();
+    const payload = parseMaybeJson(txt);
 
-const SIM_MS = 7000;
-const USE_SIMULATOR = true; // pon false si NO quieres simular
-
-async function simulateIfQuiet() {
-  const farms = await prisma.farm.findMany({ select: { id: true } });
-  for (const f of farms) {
-    const last = await prisma.report.findFirst({
-      where: { farmId: f.id },
-      orderBy: { ts: 'desc' },
+    const device = await prisma.device.upsert({
+      where: { mdnsName: sensor.key },
+      update: { lastSeen: new Date(), lastIp: sensor.host || null },
+      create: { mdnsName: sensor.key, name: sensor.key, farmId: sensor.farmId, lastSeen: new Date(), lastIp: sensor.host || null },
     });
 
-    const tooOld = !last || (Date.now() - new Date(last.ts).getTime()) > 15000; // >15s sin datos
-    if (!USE_SIMULATOR || !tooOld) continue;
-
-    // genera numeritos suaves alrededor de lo último o valores base
-    const base = last || { temp: 27, humAir: 60, humSuelo: 40, potencia: 80, min: 35, max: 65, auto: true, bomba: false };
-    const n = (x, d) => Math.max(0, Math.min(100, Number(x ?? 0) + (Math.random()*2 - 1)*d));
-
-    await prisma.report.create({
-      data: {
-        farmId: f.id,
-        temp: Number((n(base.temp ?? 27, 0.6)).toFixed(1)),
-        humAir: Math.round(n(base.humAir ?? 60, 1.5)),
-        humSuelo: Math.round(n(base.humSuelo ?? 40, 2.0)),
-        bomba: Math.random() < 0.2 ? !base.bomba : base.bomba,
-        auto: true,
-        potencia: base.potencia ?? 80,
-        min: base.min ?? 35,
-        max: base.max ?? 65,
-        analisisIA: 'Simulador activo (sin dispositivo)',
-      },
+    await prisma.reading.create({
+      data: { farmId: sensor.farmId, deviceId: device.id, payload, ts: new Date() },
     });
+
+    console.log('[ingest] ok', sensor.key);
+  } catch (err) {
+    console.warn('[ingest]', sensor.key, '->', err.message);
   }
 }
 
-setInterval(simulateIfQuiet, SIM_MS);
+if (process.env.PULL_ARDUINO === '1' && sensors.length) {
+  const interval = Number(process.env.PULL_INTERVAL_MS || 6000);
+  setInterval(() => sensors.forEach(pollOnce), interval);
+
+  // endpoint manual para disparar un pull
+  app.post('/ingest/pull', async (_req, res) => {
+    await Promise.all(sensors.map(pollOnce));
+    res.json({ ok: true, polled: sensors.map(s => s.key) });
+  });
+}
+
+// ---------- Arranque ----------
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`API on http://0.0.0.0:${PORT}`);
+  if (sensors.length) {
+    console.log('PULL enabled for:', sensors.map(s => `${s.key} -> ${s.url}`).join(', '));
+  }
+});
